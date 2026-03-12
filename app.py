@@ -1,93 +1,110 @@
 from flask import Flask, request, jsonify
 import requests
 import os
-import uuid
+import base64
 from PIL import Image
-from moviepy.editor import ImageClip, concatenate_videoclips
+from moviepy.editor import ImageClip, concatenate_videoclips, CompositeVideoClip
 from io import BytesIO
+import numpy as np
 
 app = Flask(__name__)
 
-OUTPUT_DIR = "/tmp/videos"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+def download_and_fit(url, width=1080, height=1350):
+    response = requests.get(url)
+    img = Image.open(BytesIO(response.content)).convert("RGB")
+    
+    # Mantém proporção com fundo preto
+    img.thumbnail((width, height))
+    background = Image.new('RGB', (width, height), (0, 0, 0))
+    offset = ((width - img.width) // 2, (height - img.height) // 2)
+    background.paste(img, offset)
+    return np.array(background)
 
+def make_slide_left_transition(clip1, clip2, duration=0.5, w=1080, h=1350):
+    """Gera transição slide left entre dois clips"""
+    fps = 24
+    n_frames = int(fps * duration)
+    frames = []
 
-@app.route("/health", methods=["GET"])
+    arr1 = clip1.get_frame(clip1.duration - 0.01)
+    arr2 = clip2.get_frame(0)
+
+    for i in range(n_frames):
+        progress = i / n_frames
+        offset = int(w * progress)
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        frame[:, :w - offset] = arr1[:, offset:]
+        frame[:, w - offset:] = arr2[:, :offset]
+        frames.append(frame)
+
+    return frames
+
+@app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"})
 
-
-@app.route("/gerar-video", methods=["POST"])
+@app.route('/gerar-video', methods=['POST'])
 def gerar_video():
     data = request.json
+    urls = data.get('imagens', [])
+    duracao = data.get('duracao_por_imagem', 3)
 
-    # Valida entrada
-    urls = data.get("imagens", [])
-    duracao = data.get("duracao_por_imagem", 3)  # segundos por imagem
+    if not urls:
+        return jsonify({"error": "Nenhuma imagem fornecida"}), 400
 
-    if not urls or len(urls) < 2:
-        return jsonify({"erro": "Envie ao menos 2 URLs de imagens"}), 400
+    W, H = 1080, 1350
+    fps = 24
 
-    video_id = str(uuid.uuid4())
-    output_path = f"{OUTPUT_DIR}/{video_id}.mp4"
-    temp_files = []
+    # Baixa e prepara frames de cada imagem
+    image_arrays = [download_and_fit(url, W, H) for url in urls]
 
-    try:
-        clips = []
+    # Monta o vídeo com transição slide left
+    all_frames = []
 
-        for i, url in enumerate(urls):
-            # Baixa a imagem
-            response = requests.get(url, timeout=15)
-            response.raise_for_status()
+    for i, arr in enumerate(image_arrays):
+        # Frames estáticos da imagem atual
+        static_frames = int(fps * duracao)
+        for _ in range(static_frames):
+            all_frames.append(arr)
 
-            # Abre e redimensiona para 1080x1080
-            img = Image.open(BytesIO(response.content)).convert("RGB")
-            img = img.resize((1080, 1080), Image.LANCZOS)
+        # Transição para próxima imagem (exceto na última)
+        if i < len(image_arrays) - 1:
+            next_arr = image_arrays[i + 1]
+            trans_frames = int(fps * 0.5)
+            for j in range(trans_frames):
+                progress = j / trans_frames
+                offset = int(W * progress)
+                frame = np.zeros((H, W, 3), dtype=np.uint8)
+                frame[:, :W - offset] = arr[:, offset:]
+                frame[:, W - offset:] = next_arr[:, :offset]
+                all_frames.append(frame)
 
-            # Salva temporariamente
-            temp_path = f"/tmp/{video_id}_frame_{i}.jpg"
-            img.save(temp_path, quality=95)
-            temp_files.append(temp_path)
+    # Converte para vídeo
+    output_path = '/tmp/carrossel_output.mp4'
+    
+    import imageio
+    writer = imageio.get_writer(output_path, fps=fps, codec='libx264', quality=7)
+    for frame in all_frames:
+        writer.append_data(frame)
+    writer.close()
 
-            # Cria o clip com duração definida
-            clip = ImageClip(temp_path).set_duration(duracao)
-            clips.append(clip)
+    # Retorna em base64
+    with open(output_path, 'rb') as f:
+        video_base64 = base64.b64encode(f.read()).decode('utf-8')
 
-        # Concatena todos os clips
-        final = concatenate_videoclips(clips, method="compose")
-        final.write_videofile(
-            output_path,
-            fps=24,
-            codec="libx264",
-            audio=False,
-            verbose=False,
-            logger=None
-        )
-        final.close()
+    os.remove(output_path)
+    return jsonify({"video_base64": video_base64})
 
-        # Lê o vídeo gerado e converte para base64
-        import base64
-        with open(output_path, "rb") as f:
-            video_base64 = base64.b64encode(f.read()).decode("utf-8")
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
+```
 
-        return jsonify({
-            "sucesso": True,
-            "video_base64": video_base64,
-            "total_imagens": len(urls),
-            "duracao_total": len(urls) * duracao
-        })
-
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
-
-    finally:
-        # Limpa arquivos temporários
-        for f in temp_files:
-            if os.path.exists(f):
-                os.remove(f)
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+Agora atualiza também o `requirements.txt`:
+```
+flask
+requests
+pillow
+moviepy
+numpy
+imageio
+imageio-ffmpeg
